@@ -4,13 +4,36 @@ import numpy as np
 from numba import njit
 import matplotlib.pyplot as plt
 from tqdm import tqdm
-from numba import njit
+from numba import njit, threading_layer
 import subprocess
 from scipy.sparse import csr_matrix, csc_matrix #Sparse matrix library
 from scipy.sparse.linalg import bicgstab, spilu, LinearOperator # Sparse linear algebra library
 from PIL import Image
 
+
 def charge_density(grid_size, electrons, concentration, constants):
+    '''
+    Calculate charge density from electron and ion concentration.
+    Parameters
+    ----------
+    grid_size : tuple of int
+        Size of the grid (NY, NX).
+    electrons : ndarray of float, shape (NY, NX)
+        Electron concentration in the grid.
+    concentration : ndarray of float, shape (NY, NX)
+        Ion concentration in the grid.
+    constants : dict
+        Dictionary containing physical constants:
+            - 'F': Faraday constant (float)
+            - 'dx_real': Real space grid spacing in meters (float)
+    Returns
+    -------
+    charge_density : ndarray of float, shape (NY, NX)
+    '''
+    return charge_density_njit(grid_size, electrons, concentration, constants['F'], constants['dx_real'])
+
+@njit(parallel=True)
+def charge_density_njit(grid_size, electrons, concentration, F, dx_real):
     """
     Calculate charge density from electron and ion concentration.
     Parameters
@@ -21,20 +44,23 @@ def charge_density(grid_size, electrons, concentration, constants):
         Electron concentration in the grid.
     concentration : ndarray of float, shape (NY, NX)
         Ion concentration in the grid.
+    F : float
+        Faraday constant
+    dx_real : float
+        Real space grid spacing in meters
     Returns
     -------
     charge_density : ndarray of float, shape (NY, NX)
         Charge density in the grid.
     """
     NX, NY = grid_size[1], grid_size[0]
-    F = constants['F']  # Faraday constant
-    dx_real = constants['dx_real']  # Real space grid spacing in meters
     # Initialize charge density
     charge_density = np.zeros((NY, NX))
     charge_density += -F * electrons * (dx_real**3)
     charge_density += F * concentration * (dx_real**3)
     return charge_density
 
+@njit
 def find_interface(solid_mask):
 	"""
 	Find interface nodes: solid nodes that have at least one electrolyte neighbor.
@@ -49,21 +75,21 @@ def find_interface(solid_mask):
 	interface_mask : ndarray of bool, shape (NY, NX)
 		Mask where True indicates interface nodes
 	"""
-	interface_mask = np.zeros_like(solid_mask, dtype=bool)
+	interface_mask = np.zeros_like(solid_mask, dtype=np.bool_)
 	
 	for i in range(1, solid_mask.shape[0] - 1):
 		for j in range(1, solid_mask.shape[1] - 1):
 			if solid_mask[i, j]:
 				# Check 4-connected neighbors (could extend to 8-connected)
-				neighbors = [
+				neighbors = np.array([
 					solid_mask[i-1, j],  # up
 					solid_mask[i+1, j],  # down  
 					solid_mask[i, j-1],  # left
 					solid_mask[i, j+1]   # right
-				]
+				])
 				
 				# Interface if any neighbor is not solid (i.e., electrolyte)
-				if not all(neighbors):
+				if not np.all(neighbors):
 					interface_mask[i, j] = True
 				# end if
 			# end if
@@ -234,7 +260,7 @@ def PreConditioner(Pmatrix, tol=1e-5):
 	M = LinearOperator((Pmatrix.shape[0], Pmatrix.shape[1]), matvec=ilu.solve)
 	return M
 
-def create_preconditioner(matrix, drop_tol=1e-6, fill_factor=20):
+def create_preconditioner(matrix, drop_tol=1e-8, fill_factor=40):
     """Create ILU preconditioner"""
     try:
         ilu = spilu(matrix.tocsc(), drop_tol=drop_tol, fill_factor=fill_factor)
@@ -317,99 +343,108 @@ def solve_poisson_2d(charge_density, NY, NX, constants=None, A=None, initial=Non
     
     return potential, info
 
-#gradient of the potential in the directions of the vecolities
+@njit
 def grad_potential(potential):
 	'''
-	Calculate the gradient of the potential in the directions of the velocities.
-	Args:
-		potential: 2D numpy array of potential values
-		e: 2D numpy array of velocity vectors
+	Calculate the gradient of the potential using central differences.
+	Njit-compatible version.
 	'''
+	NY, NX = potential.shape
+	delPot_xx = np.zeros_like(potential)
+	delPot_yy = np.zeros_like(potential)
 	
-	delPot_xx = np.gradient(potential, axis=1)  # central-difference ∂φ/∂x
-	delPot_yy = np.gradient(potential, axis=0)  # central-difference ∂φ/∂y
+	# Central differences for interior points
+	for i in range(1, NY-1):
+		for j in range(1, NX-1):
+			delPot_xx[i, j] = (potential[i, j+1] - potential[i, j-1]) / 2.0
+			delPot_yy[i, j] = (potential[i+1, j] - potential[i-1, j]) / 2.0
 	
+	# Forward/backward differences for boundaries
+	# Left and right boundaries
+	for i in range(NY):
+		delPot_xx[i, 0] = potential[i, 1] - potential[i, 0]
+		delPot_xx[i, -1] = potential[i, -1] - potential[i, -2]
+	
+	# Top and bottom boundaries  
+	for j in range(NX):
+		delPot_yy[0, j] = potential[1, j] - potential[0, j]
+		delPot_yy[-1, j] = potential[-1, j] - potential[-2, j]
+		
 	return delPot_xx, delPot_yy
 
-@njit
-def equilibrium_function(c_i, w, e, grid_size=None):
+def equilibrium_function(c_i, J_i, e, grid_size):
+    '''
+    Calculate the equilibrium distribution from the concentration and velocity weights.
+    Parameters
+    ----------
+    c_i : ndarray of float, shape (NY, NX)
+        Concentration field.
+    J_i : ndarray of float, shape (NY, NX)
+        Velocity weights.
+    e : ndarray of float, shape (N, 2)
+        Velocity vectors.
+    grid_size : tuple of int
+        Size of the grid (NY, NX).
+    Returns
+    -------
+    ge : ndarray of float, shape (N, NY, NX)
+    Equilibrium distribution function.
+    '''
+    return equilibrium_function_njit(c_i, J_i, e)
+
+@njit(parallel=True)
+def equilibrium_function_njit(c_i, w, e):
     '''
     Calculate the equilibrium distribution from the concentration and velocity weights
     '''
-    if grid_size is None:
-        print("Warning: grid_size is None, using c_i shape")
-        grid_size = c_i.shape
-    #end if
-
-    NY, NX = grid_size
+    NY, NX = c_i.shape
     ge = np.zeros((len(e), NY, NX), dtype=np.float64)
     for a in range(len(e)):
         ge[a] = w[a] * c_i
     return ge
 
-
-def stream_and_bounce(g, c_i, velocity_vectors, solid_mask, electrolyte_mask, boundary_mask, constants):
-    """
-    Perform D2Q9 streaming with boundary conditions applied in sequence:
-    1. Stream all distributions
-    2. Apply boundary bounce-back
-    3. Apply interface conditions
-    
-    Parameters
-    ----------
-    g : ndarray, shape (9, NY, NX)
-        Post-collision distribution
-    c_i : ndarray, shape (NY, NX)
-        Current concentration field
-    solid_mask, electrolyte_mask, boundary_mask : ndarray of bool, shape (NY, NX)
-        Phase masks
-    
-    Returns
-    -------
-    g_new : ndarray, shape (9, NY, NX)
-        Distribution after streaming and boundary conditions
-    """
-    # Constants
-    C_max = constants['C_max']
-    e = velocity_vectors['e']
-    opp_list = velocity_vectors['opp_list']
-    
-    # Step 1: Apply interface conditions
-    interface_mask = find_interface(solid_mask)
-
-    g = interface_condition(g, c_i, velocity_vectors, interface_mask, electrolyte_mask, C_max=C_max)
-
-    # Step 2: Stream all distributions
-
-    g_streamed = np.zeros_like(g)
-    for a in range(len(e)):
-        cx, cy = e[a]
-        g_streamed[a] = np.roll(np.roll(g[a], cx, axis=1), cy, axis=0)
-    
-    # Step 3: Apply standard boundary conditions
-    g_new = g_streamed.copy()
-    
-    # Bounce-back at domain boundaries
-    for a in range(len(e)):
-        g_new[opp_list[a]][boundary_mask] = g_streamed[a][boundary_mask]
-    
-
-    
-    return g_new
-
-
-def interface_condition(g, c_i, velocity_vectors, interface_mask, electrolyte_mask, C_max=100):
+@njit
+def interface_condition_njit(g, c_i, e, opp_list, interface_mask, electrolyte_mask, C_max=100.0):
     """
     Apply interface condition to the distribution function g at the interface.
+
+    This function implements a one-way bounce-back condition at the interface 
+    for a lattice Boltzmann model. It modifies the distribution function `g` 
+    based on the concentration `c_i` at the interface and the presence of 
+    electrolytes. The function handles both saturated and unsaturated interface 
+    conditions, allowing for partial diffusion when the interface is not saturated.
+
+    Parameters:
+    g : numpy.ndarray
+        The distribution function array with shape (num_directions, height, width).
+    c_i : numpy.ndarray
+        The concentration array at the interface with shape (height, width).
+    e : list of tuples
+        List of lattice directions as (cx, cy) tuples.
+    opp_list : list
+        List of opposite directions corresponding to `e`.
+    interface_mask : numpy.ndarray
+        A boolean mask indicating the interface locations with shape (height, width).
+    electrolyte_mask : numpy.ndarray
+        A boolean mask indicating the electrolyte locations with shape (height, width).
+    C_max : float, optional
+        The maximum concentration allowed at the interface (default is 100.0).
+
+    Returns:
+    numpy.ndarray
+        The modified distribution function `g` after applying the interface conditions.
+    
+    Notes:
+    - The function assumes that the input arrays are properly shaped and that 
+      the masks are boolean arrays indicating the relevant locations.
+    - The bounce-back condition is applied only at the interface locations 
+      specified by `interface_mask`.
+    - The function is optimized for performance using Numba's njit decorator.
     """
-    # Get the opposite directions for bounce-back
-    opp_list = velocity_vectors['opp_list']
-    # Get the velocity vectors
-    e = velocity_vectors['e']
     # One way bounce-back condition at the interface
     for i in range(g.shape[1]):
         for j in range(g.shape[2]):
-            if interface_mask[i, j]:  # Fixed variable name
+            if interface_mask[i, j]:
                 for a in range(len(e)):
                     cx, cy = e[a]
                     # Calculate neighbor indices
@@ -423,7 +458,7 @@ def interface_condition(g, c_i, velocity_vectors, interface_mask, electrolyte_ma
                                 # Complete bounce-back: swap distributions
                                 temp = g[a, ni, nj]
                                 g[a, ni, nj] += g[opp_list[a], ni, nj]
-                                g[opp_list[a], ni, nj] = 0
+                                g[opp_list[a], ni, nj] = 0.0
                                 
                             # Interface not saturated - allow partial diffusion
                             else:
@@ -438,50 +473,74 @@ def interface_condition(g, c_i, velocity_vectors, interface_mask, electrolyte_ma
                                     # Accept only what fits, bounce back the rest
                                     accept_fraction = available_capacity / incoming_mass
                                     g[opp_list[a], ni, nj] *= accept_fraction
-                                    g[a, ni, nj] += incoming_mass * (1 - accept_fraction)
+                                    g[a, ni, nj] += incoming_mass * (1.0 - accept_fraction)
     
     return g
 
-# @njit
-def collision_stream(g, c_i, w, velocity_vectors, J_i, tau, potential, solid_mask, electrolyte_mask, boundary_mask, constants):
+@njit
+def stream_and_bounce_njit(g, c_i, e, opp_list, solid_mask, electrolyte_mask, boundary_mask, interface_mask, C_max):
     """
-    One LBM step: collision → stream+on-link bounce → macroscopic update.
-
-    Steps
-    -----
-    1) Collision: relax g toward local equilibrium ge.  
-        g += -(g - ge) / tau_g
-
-    2) Streaming + on-link bounce-back:  
-        g = stream_and_bounce(g, electrolyte_mask)
-
-    3) Macroscopic update:  
-        c_i = sum_a g[a]
-
-    Parameters
-    ----------
-    g : ndarray, shape (9, NY, NX)
-        Current discrete distributions.
-    c_i : ndarray, shape (NY, NX)
-        Current concentration field.
-    w : ndarray, shape (9,)
-        D2Q9 weights.
-
-    Returns
-    -------
-    g : ndarray, shape (9, NY, NX)
-        Updated distributions.
-    c_i : ndarray, shape (NY, NX)
-        Updated concentration.
+    Perform D2Q9 streaming with boundary conditions applied in sequence:
+    1. Apply interface conditions
+    2. Stream all distributions
+    3. Apply boundary bounce-back
+    
+    Njit-compatible version.
     """
-    tau_g_s = tau['Solid']
-    tau_g_e = tau['Electrolyte']
-    z, F, R, T, dx_real = constants['z'], constants['F'], constants['R'], constants['T'], constants['dx_real']
+    
+    # Step 1: Apply interface conditions
+    g = interface_condition_njit(g, c_i, e, opp_list, interface_mask, electrolyte_mask, C_max=C_max)
+
+    # Step 2: Stream all distributions
+    g_streamed = np.zeros_like(g)
+    for a in range(len(e)):
+        cx, cy = e[a]
+        # Manual streaming using loops (njit compatible)
+        for i in range(g.shape[1]):
+            for j in range(g.shape[2]):
+                # Source indices with periodic wrapping
+                src_i = (i - cy) % g.shape[1]
+                src_j = (j - cx) % g.shape[2]
+                g_streamed[a, i, j] = g[a, src_i, src_j]
+    
+    # Step 3: Apply standard boundary conditions
+    g_new = g_streamed.copy()
+    
+    # Bounce-back at domain boundaries
+    for a in range(len(e)):
+        for i in range(g.shape[1]):
+            for j in range(g.shape[2]):
+                if boundary_mask[i, j]:
+                    g_new[opp_list[a], i, j] = g_streamed[a, i, j]
+    
+    return g_new
+
+def stream_and_bounce(g, c_i, velocity_vectors, solid_mask, electrolyte_mask, boundary_mask, constants):
+    """
+    Wrapper function that calls the njit version with unpacked parameters.
+    """
+    # Constants
+    C_max = constants['C_max']
     e = velocity_vectors['e']
     opp_list = velocity_vectors['opp_list']
+    
+    # Find interface
+    interface_mask = find_interface(solid_mask)
+    
+    return stream_and_bounce_njit(g, c_i, e, opp_list, solid_mask, electrolyte_mask, boundary_mask, interface_mask, C_max)
+
+@njit(parallel=True)
+def collision_stream_njit(g, c_i, w, e, opp_list, J_i, tau_solid, tau_electrolyte, potential, 
+                         solid_mask, electrolyte_mask, boundary_mask, interface_mask, 
+                         z, F, R, T, dx_real, C_max):
+    """
+    One LBM step: collision → stream+on-link bounce → macroscopic update.
+    Njit-compatible version.
+    """
     NY, NX = g.shape[1], g.shape[2]
+    
     # 1) collision
-    ge = equilibrium_function(c_i, J_i, e, grid_size=(NY, NX))
+    ge = equilibrium_function_njit(c_i, J_i, e)
     grad_xx, grad_yy = grad_potential(potential)
 
     # Relaxation step towards equilibrium
@@ -490,18 +549,41 @@ def collision_stream(g, c_i, w, velocity_vectors, J_i, tau, potential, solid_mas
         grad_proj = (cx * grad_xx + cy * grad_yy) * 1e-1
         
         # Solid Relaxation step towards equilibrium diffusion
-        g[a][(solid_mask)] += -(g[a][(solid_mask)] - ge[a][(solid_mask)]) / tau_g_s
+        for i in range(NY):
+            for j in range(NX):
+                if solid_mask[i, j]:
+                    g[a, i, j] += -(g[a, i, j] - ge[a, i, j]) / tau_solid
 
         # Electrolyte Relaxation step towards equilibrium diffusion 
-        g[a][(electrolyte_mask)] += -(g[a][(electrolyte_mask)] - ge[a][(electrolyte_mask)]) / tau_g_e
-        
-        # Electrolyte Relaxation step towards equilibrium driven by electric potential
-        g[a][electrolyte_mask] += ((z * F*dx_real) / (R * T)) * (grad_proj[electrolyte_mask]) * ge[a][electrolyte_mask]
+        for i in range(NY):
+            for j in range(NX):
+                if electrolyte_mask[i, j]:
+                    g[a, i, j] += -(g[a, i, j] - ge[a, i, j]) / tau_electrolyte
+                    # Electrolyte Relaxation step towards equilibrium driven by electric potential
+                    g[a, i, j] += ((z * F * dx_real) / (R * T)) * grad_proj[i, j] * ge[a, i, j]
 
-    # 2) stream + bounce
-    g = stream_and_bounce(g, c_i, velocity_vectors, solid_mask, electrolyte_mask, boundary_mask, constants)
+    # 2) stream + bounce  
+    g = stream_and_bounce_njit(g, c_i, e, opp_list, solid_mask, electrolyte_mask, boundary_mask, interface_mask, C_max)
 
     # 3) macroscopic
     c_i = np.sum(g, axis=0)
-    # c_i = np.round(c_i, 12)  # round to 2 decimal places for clarity
+    
     return g, c_i
+
+def collision_stream(g, c_i, w, velocity_vectors, J_i, tau, potential, solid_mask, electrolyte_mask, boundary_mask, constants):
+    """
+    Wrapper function for the njit version.
+    """
+    tau_g_s = tau['Solid']
+    tau_g_e = tau['Electrolyte']
+    z, F, R, T, dx_real = constants['z'], constants['F'], constants['R'], constants['T'], constants['dx_real']
+    C_max = constants['C_max']
+    e = velocity_vectors['e']
+    opp_list = velocity_vectors['opp_list']
+    
+    # Find interface
+    interface_mask = find_interface(solid_mask)
+    
+    return collision_stream_njit(g, c_i, w, e, opp_list, J_i, tau_g_s, tau_g_e, potential, 
+                                solid_mask, electrolyte_mask, boundary_mask, interface_mask, 
+                                z, F, R, T, dx_real, C_max)
