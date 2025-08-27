@@ -56,8 +56,9 @@ def charge_density_njit(grid_size, electrons, concentration, F, dx_real):
     NX, NY = grid_size[1], grid_size[0]
     # Initialize charge density
     charge_density = np.zeros((NY, NX))
-    charge_density += -F * electrons * (dx_real**3)
-    charge_density += F * concentration * (dx_real**3)
+    #convert from mol/lattice**3 to C/m^3, dx_real = 1e-7 m/lattice
+    charge_density += -F * electrons #* (dx_real**3) # F is Coloumbs per mole, and concentrations is in mol/m**3
+    charge_density += F * concentration #* (dx_real**3) # F is Coloumbs per mole, and concentrations is in mol/m**3
     return charge_density
 
 @njit
@@ -309,8 +310,7 @@ def solve_poisson_2d(charge_density, NY, NX, constants=None, A=None, initial=Non
         sys.exit(1)
     
     # Scale epsilon by dx to dimensionless it
-    epsilon = epsilon * constants['dx_real']
-
+    epsilon = epsilon #* constants['dx_real'] # epsilon is in real coordinates
     # Create RHS vector
     rhs = (-charge_density.flatten() / epsilon)
     
@@ -332,7 +332,7 @@ def solve_poisson_2d(charge_density, NY, NX, constants=None, A=None, initial=Non
         print(f"⚠ Solver warning: convergence flag = {convergence_flag}")
     
     # Reshape solution back to 2D
-    potential = solution.reshape((NY, NX))
+    potential = solution.reshape((NY, NX)) 
     
     info = {
         'convergence_flag': convergence_flag,
@@ -407,39 +407,7 @@ def equilibrium_function_njit(c_i, w, e):
 def interface_condition_njit(g, c_i, e, opp_list, interface_mask, electrolyte_mask, C_max=100.0):
     """
     Apply interface condition to the distribution function g at the interface.
-
-    This function implements a one-way bounce-back condition at the interface 
-    for a lattice Boltzmann model. It modifies the distribution function `g` 
-    based on the concentration `c_i` at the interface and the presence of 
-    electrolytes. The function handles both saturated and unsaturated interface 
-    conditions, allowing for partial diffusion when the interface is not saturated.
-
-    Parameters:
-    g : numpy.ndarray
-        The distribution function array with shape (num_directions, height, width).
-    c_i : numpy.ndarray
-        The concentration array at the interface with shape (height, width).
-    e : list of tuples
-        List of lattice directions as (cx, cy) tuples.
-    opp_list : list
-        List of opposite directions corresponding to `e`.
-    interface_mask : numpy.ndarray
-        A boolean mask indicating the interface locations with shape (height, width).
-    electrolyte_mask : numpy.ndarray
-        A boolean mask indicating the electrolyte locations with shape (height, width).
-    C_max : float, optional
-        The maximum concentration allowed at the interface (default is 100.0).
-
-    Returns:
-    numpy.ndarray
-        The modified distribution function `g` after applying the interface conditions.
-    
-    Notes:
-    - The function assumes that the input arrays are properly shaped and that 
-      the masks are boolean arrays indicating the relevant locations.
-    - The bounce-back condition is applied only at the interface locations 
-      specified by `interface_mask`.
-    - The function is optimized for performance using Numba's njit decorator.
+    Njit-compatible version.
     """
     # One way bounce-back condition at the interface
     for i in range(g.shape[1]):
@@ -542,11 +510,13 @@ def collision_stream_njit(g, c_i, w, e, opp_list, J_i, tau_solid, tau_electrolyt
     # 1) collision
     ge = equilibrium_function_njit(c_i, J_i, e)
     grad_xx, grad_yy = grad_potential(potential)
-
+    #Convert from lattice to real units
+    # grad_xx /= dx_real #m/lattice unit
+    # grad_yy /= dx_real #m/lattice unit
     # Relaxation step towards equilibrium
     for a in range(len(e)):
         cx, cy = e[a]
-        grad_proj = (cx * grad_xx + cy * grad_yy) * 1e-1
+        grad_proj = (cx * grad_xx + cy * grad_yy) 
         
         # Solid Relaxation step towards equilibrium diffusion
         for i in range(NY):
@@ -560,7 +530,7 @@ def collision_stream_njit(g, c_i, w, e, opp_list, J_i, tau_solid, tau_electrolyt
                 if electrolyte_mask[i, j]:
                     g[a, i, j] += -(g[a, i, j] - ge[a, i, j]) / tau_electrolyte
                     # Electrolyte Relaxation step towards equilibrium driven by electric potential
-                    g[a, i, j] += ((z * F * dx_real) / (R * T)) * grad_proj[i, j] * ge[a, i, j]
+                    g[a, i, j] += ((z * F) / (R * T)) * grad_proj[i, j] * ge[a, i, j]
 
     # 2) stream + bounce  
     g = stream_and_bounce_njit(g, c_i, e, opp_list, solid_mask, electrolyte_mask, boundary_mask, interface_mask, C_max)
