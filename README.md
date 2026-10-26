@@ -13,3 +13,4 @@ DOI: 10.1016/j.ijheatmasstransfer.2013.03.048
 DOI: 10.1016/j.jpowsour.2019.227249
 
 This program is under the GPL V3 licence and can be cited via the Figshare doi:
+https://doi.org/10.6084/m9.figshare.29661095
